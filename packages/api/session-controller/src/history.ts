@@ -19,6 +19,7 @@ import { SessionQueryError, type SessionObservation } from '@deepseek-ai/dsh-ses
 import type {} from '@deepseek-ai/dsh-subagent'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import { losslessProjectionValues } from './projection-values.ts'
 import type {
   SessionAddress,
   SessionAssistantStreamFrame,
@@ -29,7 +30,6 @@ import type {
   SessionPage,
   SessionPageRequest,
   SessionProjectionBaseline,
-  SessionProjectionValues,
   SessionWireHeader,
   SessionWireEvent,
 } from './types.ts'
@@ -196,7 +196,7 @@ export class SessionHistoryController {
         hasMore: page.hasMore,
         projections: source.projections === undefined
           ? { asOfSeq: cursor, values: {} }
-          : projectionBlock(source.projections),
+          : projectionBlock(source.projections, this.ctx, target),
         ...assistantStream === undefined ? {} : { assistantStream },
       }
       if (address.kind === 'session' && source.source === 'prepared') {
@@ -292,11 +292,20 @@ function wireAssistantStreamFrame(
 
 function projectionBlock(
   snapshot: NonNullable<SessionObservation['projections']>,
+  ctx: Context,
+  sessionId: SessionId,
 ): SessionProjectionBaseline {
   return {
     asOfSeq: snapshot.asOfSeq,
-    // Projection definitions validate whole JSON values before snapshot publication.
-    values: snapshot.values as SessionProjectionValues,
+    // A projection definition validates its value with its `viewSchema`, which
+    // is not a JSON check: this baseline leaves as a stream item, whose only
+    // serialization is `JSON.stringify`, so a cell JSON cannot carry is
+    // omitted rather than sent corrupted.
+    values: losslessProjectionValues(snapshot.values, (key) => {
+      ctx.logger.warn(
+        `session-controller.history: projection "${key}" of "${sessionId}" is not lossless JSON; omitting that cell`,
+      )
+    }),
   }
 }
 

@@ -261,13 +261,16 @@ describe('SessionProjectionCache write policy', () => {
     expect(write).toHaveBeenCalledExactlyOnceWith(session)
   })
 
-  it('write() on a never-dirty session checkpoints directly and rejects a non-JSON unit state', async () => {
+  it('write() checkpoints a never-dirty session and omits only the non-JSON unit row', async () => {
     const { ctx, root } = await harness()
     // Never dirtied: no events — write() still lands the init-derived cut.
     const clean = ctx.sessions.create(SessionId('clean-write'))
     await ctx.sessionProjectionCache.write(clean)
     expect((await storedRows(root, clean.id))?.['cache-test/marks']).toEqual({ ver: 1, seq: -1, val: null })
-    // A unit whose state violates the plain-JSON contract fails the write loud.
+    // A unit whose state violates the plain-JSON contract loses its own row:
+    // the remaining rows still land, so the session's cache never strands at
+    // an old cut because of one unit.
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
     ctx.sessionProjections.register({
       key: 'cache-test/marks2',
       stateSchema: z.custom<Map<string, string>>(() => true),
@@ -275,7 +278,41 @@ describe('SessionProjectionCache write policy', () => {
       apply: state => state,
       stateVersion: 1,
     })
-    await expect(ctx.sessionProjectionCache.write(clean)).rejects.toThrow('not losslessly JSON-serializable')
+    await ctx.sessionProjectionCache.write(clean)
+    const rows = await storedRows(root, clean.id)
+    expect(rows?.['cache-test/marks']).toEqual({ ver: 1, seq: -1, val: null })
+    expect(rows !== undefined && 'cache-test/marks2' in rows).toBe(false)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('cache-test/marks2'))
+  })
+
+  it('still advances the record when every registered row violates the plain-JSON contract', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-'))
+    roots.push(root)
+    const ctx = new Context()
+    contexts.push(ctx)
+    await ctx.plugin(Storage)
+    await ctx.plugin({ name: storageJsonName, inject: storageJsonInject, apply: storageJsonApply, Config: storageJsonConfig }, { root })
+    await ctx.plugin({ name: storageDomainName, inject: storageDomainInject, apply: storageDomainApply, Config: storageDomainConfig }, { backend: 'json' })
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    // The ONLY registered unit has a non-JSON state: the record must still land
+    // (with no rows) so the session is never stranded at a stale cut, and the
+    // omission is reported per key.
+    ctx.sessionProjections.register({
+      key: 'cache-test/marks2',
+      stateSchema: z.custom<Map<string, string>>(() => true),
+      init: () => new Map<string, string>(),
+      apply: state => state,
+      stateVersion: 1,
+    })
+    await ctx.plugin(SessionProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 60_000 })
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    const session = ctx.sessions.create(SessionId('all-rows-lossy'))
+
+    await ctx.sessionProjectionCache.write(session)
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('cache-test/marks2'))
+    expect(await storedRows(root, session.id)).toEqual({})
   })
 
   it('plugin disposal clears armed interval timers and leaves cleaned sessions alone', async () => {

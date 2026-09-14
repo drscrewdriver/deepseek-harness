@@ -7,13 +7,13 @@ import type { JobSnapshot } from '@deepseek-ai/dsh-jobs'
 import type {
   Session, SessionId, UserMessage,
 } from '@deepseek-ai/dsh-session'
-import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import { isJsonValue, type JsonValue } from '@deepseek-ai/dsh-util-values'
+import { losslessProjectionValues } from './projection-values.ts'
 import type {
   SessionControlBaseline,
   SessionControlFrame,
   SessionJob,
   SessionProjectionBaseline,
-  SessionProjectionValues,
   SessionQueuedItem,
 } from './types.ts'
 
@@ -24,6 +24,16 @@ export class SessionControlController {
   /** @param ctx - Host context carrying live Agent, projection, and jobs services. */
   constructor(private readonly ctx: Context) {
     ctx.sessionProjections.onChanged((session, key, value, seq) => {
+      // The registry validates every published value with the unit's
+      // `viewSchema`, which accepts values JSON cannot carry; this stream is
+      // `JSON.stringify`-ed with no JSON check, so such a value would reach the
+      // Client corrupted (a Map as `{}`) rather than absent.
+      if (!isJsonValue(value)) {
+        ctx.logger.warn(
+          `session-controller.control: projection "${key}" of "${session.id}" is not lossless JSON; skipping its frame`,
+        )
+        return
+      }
       this.broadcast({
         type: 'projection',
         sessionId: session.id,
@@ -95,8 +105,14 @@ export class SessionControlController {
       const snapshot = this.ctx.sessionProjections.snapshot(session)
       blocks[session.id] = {
         asOfSeq: snapshot.asOfSeq,
-        // Every projection definition validates its value before snapshot publication.
-        values: snapshot.values as SessionProjectionValues,
+        // Baseline values cross the same JSON check as the change frames: a
+        // unit's `viewSchema` is not a JSON check, so a cell it accepts may
+        // still be a value this stream's `JSON.stringify` would corrupt.
+        values: losslessProjectionValues(snapshot.values, (key) => {
+          this.ctx.logger.warn(
+            `session-controller.control: projection "${key}" of "${session.id}" is not lossless JSON; omitting that cell`,
+          )
+        }),
       }
     }
     return blocks

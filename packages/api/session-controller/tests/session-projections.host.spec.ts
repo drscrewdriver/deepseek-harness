@@ -44,9 +44,11 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
     'test/last-user': LastUserState
     'test/internal-count': number
     'test/private-prompt': string | null
+    'test/lossy': { seen: number }
   }
   interface SessionProjectionMap {
     'test/last-user': { text: string } | null
+    'test/lossy': Map<string, string>
   }
 }
 
@@ -117,6 +119,23 @@ const privatePromptUnit = () => ({
     : state),
   stateVersion: 1,
 }) satisfies ProjectionDefinition<'test/private-prompt', string | null>
+
+/**
+ * Plain-JSON state behind a wire view that leaves the JSON value set (a Map).
+ * `changing` advances the state on every event so the changed view reaches the
+ * change feed instead of being suppressed by `Object.is`.
+ */
+const lossyUnit = (changing = false) => ({
+  key: 'test/lossy',
+  stateSchema: z.object({ seen: z.number() }),
+  init: () => ({ seen: 0 }),
+  apply: (state: { seen: number }) => (changing ? { seen: state.seen + 1 } : state),
+  wire: {
+    viewSchema: z.custom<Map<string, string>>(() => true),
+    view: () => new Map([['a', 'b']]),
+  },
+  stateVersion: 1,
+}) satisfies ProjectionDefinition<'test/lossy', { seen: number }>
 
 async function harness(withRegistry: boolean): Promise<{
   ctx: Context
@@ -233,6 +252,22 @@ describe('session.history projections block', () => {
     // asOfSeq IS the window tail: the last served event carries it.
     const last = records.at(-1)
     expect(last?.event.seq).toBe(projections.asOfSeq)
+  })
+
+  it('omits a non-lossless cell from the tail block while keeping the others', async () => {
+    const { ctx, session } = await harness(true)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    ctx.sessionProjections.register(lossyUnit())
+    ctx.sessionProjections.register(lastUserUnit())
+    seedMessages(session, 2)
+
+    const snapshot = await opening(remote(ctx), session.id)
+
+    expect(snapshot.projections.values['test/last-user']).toEqual({ text: 'm1' })
+    expect('test/lossy' in snapshot.projections.values).toBe(false)
+    // The cut is the registry's: dropping a cell never moves it forward.
+    expect(snapshot.projections.asOfSeq).toBe(session.seq - 1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('session-controller.history'))
   })
 
   it('reconstructs a cold persisted queue without publishing or resuming an Agent', async () => {
@@ -647,6 +682,43 @@ describe('session.list projections column', () => {
     expect(row).toBeDefined()
     expect(row !== undefined && 'projections' in row).toBe(false)
   })
+
+  it('leaves the column out entirely when every cached cell is not lossless JSON', async () => {
+    const { ctx } = await harness(true)
+    const coldId = SessionId('session-cold-lossy')
+    ctx.provide('sessionPersistence', testSessionPersistence(ctx, {
+      list: async () => [{ version: SESSION_FORMAT_VERSION, id: coldId, createdAt: 5, isSeeded: false, cwd: '/tmp' }],
+    }) as never)
+    ctx.provide('sessionProjectionCache', {
+      cachedSnapshot: () => ({
+        asOfSeq: SessionSeq(7),
+        values: { 'test/lossy': new Map([['a', 'b']]) },
+      }),
+    } as never)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+
+    const response = await remote(ctx).list(request({}))
+    if (!response.ok) throw new Error('unreachable')
+    const row = response.value.items.find(item => item.sessionId === coldId)
+    expect(row).toBeDefined()
+    expect(row !== undefined && 'projections' in row).toBe(false)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('test/lossy'))
+  })
+
+  it('omits one non-lossless cell while keeping the row and its remaining cells', async () => {
+    const { ctx, session } = await harness(true)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    ctx.sessionProjections.register(lossyUnit())
+    ctx.sessionProjections.register(lastUserUnit())
+    seedMessages(session, 1)
+    const response = await remote(ctx).list(request({}))
+    if (!response.ok) throw new Error('unreachable')
+    const row = response.value.items.find(item => item.sessionId === session.id)
+    expect(row).toBeDefined()
+    expect(row?.projections?.values).toHaveProperty('test/last-user')
+    expect(row?.projections?.values).not.toHaveProperty('test/lossy')
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('test/lossy'))
+  })
 })
 
 describe('Session control projection frames', () => {
@@ -663,6 +735,45 @@ describe('Session control projection frames', () => {
     }
     return frames
   }
+
+  it('omits one non-lossless cell from the baseline', async () => {
+    const { ctx, session } = await harness(true)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    ctx.sessionProjections.register(lossyUnit())
+    ctx.sessionProjections.register(lastUserUnit())
+    const abort = new AbortController()
+
+    const iterator = remote(ctx).control(abort.signal)[Symbol.asyncIterator]()
+    const baseline = await iterator.next()
+    if (baseline.done || baseline.value.type !== 'baseline') {
+      throw new Error('control stream ended before its baseline')
+    }
+    const block = baseline.value.value.projections[session.id]
+    expect(block?.values).toHaveProperty('test/last-user')
+    expect(block !== undefined && 'test/lossy' in block.values).toBe(false)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('test/lossy'))
+    abort.abort()
+    await iterator.return?.()
+  })
+
+  it('skips a non-JSON projection change frame instead of serializing it', async () => {
+    const { ctx, session } = await harness(true)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    ctx.sessionProjections.register(lossyUnit(true))
+    ctx.sessionProjections.register(lastUserUnit())
+    const proxy = remote(ctx)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    const abort = new AbortController()
+    const collected = collect(proxy.control(abort.signal), 2, abort)
+    seedMessages(session, 1)
+
+    const keys = (await collected)
+      .filter((frame): frame is Extract<SessionControlFrame, { type: 'projection' }> => frame.type === 'projection')
+      .map(frame => frame.key)
+    expect(keys.sort()).toEqual(['sessionListMetadata', 'test/last-user'])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('test/lossy'))
+  })
 
   it('broadcasts changed view references with the causing seq and skips same-reference applies', async () => {
     const { ctx, session } = await harness(true)

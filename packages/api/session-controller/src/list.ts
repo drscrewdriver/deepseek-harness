@@ -10,12 +10,13 @@ import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import { SessionQueryError, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { z } from 'zod'
+import { losslessProjectionValues } from './projection-values.ts'
 import {
   SESSION_SEARCH_RESULT_LIMIT,
   SESSION_SEARCH_SNIPPET_MAX_CODE_POINTS,
 } from './types.ts'
 import type {
-  SessionListMetadata, SessionProjectionHints, SessionProjectionValues, SessionSearchItem,
+  SessionListMetadata, SessionProjectionHints, SessionSearchItem,
   SessionSearchValue, SessionSummary,
 } from './types.ts'
 
@@ -277,13 +278,19 @@ export class ApiSessionList {
           : cache?.cachedSnapshot(header, SessionLogOffset(0))
             ?? cache?.cachedPredecessorTitle(header, SessionLogOffset(0))
         : this.ctx.sessionProjections.cachedSnapshot(session)
-      return block !== undefined && Object.keys(block.values).length > 0
-        ? {
-          asOfSeq: block.asOfSeq,
-          // Listing hints contain every currently cached wire value but remain
-          // partial: missing cells and cache rows are never materialized here.
-          values: block.values as SessionProjectionValues,
-        }
+      if (block === undefined) return undefined
+      // Listing hints contain every currently cached wire value but remain
+      // partial: missing cells and cache rows are never materialized here, and
+      // a cell that is not lossless JSON is omitted instead of failing the row
+      // or the host event that carries it. `asOfSeq` stays the registry's cut,
+      // so an omission can only overstate staleness.
+      const values = losslessProjectionValues(block.values, (key) => {
+        this.ctx.logger.warn(
+          `api-session.list: projection "${key}" of "${header.id}" is not lossless JSON; omitting that cell`,
+        )
+      })
+      return Object.keys(values).length > 0
+        ? { asOfSeq: block.asOfSeq, values }
         : undefined
     } catch (error) {
       this.ctx.logger.warn(

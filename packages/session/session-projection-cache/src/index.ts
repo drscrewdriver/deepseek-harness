@@ -375,11 +375,26 @@ export class SessionProjectionCache extends Service {
     }
   }
 
-  /** Replace one session's stored record with its log identity and a detached snapshot of `rows`. */
+  /**
+   * Replace one session's stored record with its log identity and a detached
+   * snapshot of `rows`. A row whose state violates the plain-JSON contract is
+   * omitted from the record instead of failing it: the cache is a fold
+   * shortcut, so an omitted row costs a full refold for its key on the next
+   * cold read (`restoreFloor` already reads an absent row as that key's
+   * refold floor), while a failed record would strand every row of the
+   * session at the previous cut.
+   */
   private async put(id: SessionId, identity: CheckpointIdentity, rows: ProjectionCheckpoint): Promise<void> {
-    const detached = snapshotJsonValue(rows)
-    if (detached === undefined) {
-      throw new TypeError('projection checkpoint is not losslessly JSON-serializable (a unit state violates the plain-JSON contract)')
+    const detached: Record<string, unknown> = {}
+    for (const [key, row] of Object.entries(rows)) {
+      const value = snapshotJsonValue(row)
+      if (value === undefined) {
+        this.ctx.logger.warn(
+          `session projection cache: omitted projection row "${key}" for "${id}" (its state violates the plain-JSON contract); that key refolds on the next cold read`,
+        )
+        continue
+      }
+      detached[key] = value
     }
     await this.requireTable().put(id, { identity, rows: detached as CheckpointRecord['rows'] })
   }
